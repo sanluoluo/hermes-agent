@@ -9,6 +9,7 @@ reports exactly what was skipped and why.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import errno
 import hashlib
 import json
@@ -44,6 +45,10 @@ SUPPORTED_SECRET_TARGETS={
     "VOICE_TOOLS_OPENAI_KEY",
 }
 WORKSPACE_INSTRUCTIONS_FILENAME = "AGENTS" + ".md"
+# Destination paths (relative to ``target_root``) that hold private data and must be
+# owner-only (0o600) after every write path touches them: ``.env`` carries plaintext
+# provider API keys, the memory stores carry private user data.
+_PRIVATE_MIGRATION_FILES = frozenset({".env", "memories/MEMORY.md", "memories/USER.md"})
 MIGRATION_OPTION_METADATA: Dict[str, Dict[str, str]] = {
     "soul": {
         "label": "SOUL.md",
@@ -1333,6 +1338,11 @@ class Migrator:
                 shutil.copystat(source, destination)
             else:
                 shutil.copy2(source, destination)
+            if str(destination.relative_to(self.target_root)) in _PRIVATE_MIGRATION_FILES:
+                # write_text/copy2 above preserve or derive the source's mode; a loose
+                # source (umask 0o644) must not leak into the migrated profile.
+                with contextlib.suppress(OSError):
+                    os.chmod(str(destination), 0o600)
             self.record(kind, source, destination, "migrated", backup=str(backup_path) if backup_path else None)
         else:
             self.record(kind, source, destination, "migrated", "Would copy")
