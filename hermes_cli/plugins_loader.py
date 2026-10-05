@@ -46,7 +46,10 @@ _MAX_LOAD_TIMEOUT_SECS = 600.0
 _MAX_ABANDONED_LOADERS = 8
 _ABANDONED_LOADERS: List[threading.Thread] = []
 _ABANDONED_LOADERS_LOCK = threading.Lock()
-_IN_PLUGIN_LOAD = threading.local()  # ``.active`` on a loader worker thread
+# PluginContexts of the outermost deadline-bounded load; set only inside its worker.
+_IN_PLUGIN_LOAD: contextvars.ContextVar[Optional[List["PluginContext"]]] = contextvars.ContextVar(
+    "hermes_plugin_load_scope", default=None,
+)
 
 
 class PluginLoadTimeout(Exception):
@@ -55,7 +58,7 @@ class PluginLoadTimeout(Exception):
 
 def in_plugin_load_worker() -> bool:
     """True on a deadline worker thread; re-entrant discovery from there must not block on its own parent."""
-    return bool(getattr(_IN_PLUGIN_LOAD, "active", False))
+    return _IN_PLUGIN_LOAD.get() is not None
 
 
 def _resolve_plugin_load_timeout() -> float:
@@ -105,6 +108,14 @@ def run_with_load_deadline(plugin_key: str, ctx: "PluginContext", fn: Callable[[
     and :class:`PluginLoadTimeout` is raised on the calling thread so the usual failure path records the
     reason and disposes whatever was registered before the hang.
     """
+    # Re-entrant load on our own deadline worker: run inline; the outer deadline covers it.
+    outer_scope = _IN_PLUGIN_LOAD.get()
+    if outer_scope is not None:
+        outer_scope.append(ctx)
+        try:
+            return fn()
+        finally:
+            outer_scope.remove(ctx)
     timeout = _resolve_plugin_load_timeout()
     if timeout <= 0:
         return fn()
@@ -112,12 +123,16 @@ def run_with_load_deadline(plugin_key: str, ctx: "PluginContext", fn: Callable[[
     outcome: List[Any] = []
     failure: List[BaseException] = []
 
+    scope = [ctx]
+
     def _worker() -> None:
-        _IN_PLUGIN_LOAD.active = True
+        token = _IN_PLUGIN_LOAD.set(scope)
         try:
             outcome.append(fn())
         except BaseException as exc:  # re-raised on the loading thread, KeyboardInterrupt included
             failure.append(exc)
+        finally:
+            _IN_PLUGIN_LOAD.reset(token)
 
     worker = threading.Thread(
         target=contextvars.copy_context().run, args=(_worker,), name=f"plugin-load:{plugin_key}", daemon=True,
@@ -125,7 +140,8 @@ def run_with_load_deadline(plugin_key: str, ctx: "PluginContext", fn: Callable[[
     worker.start()
     worker.join(timeout)
     if worker.is_alive():
-        ctx._abandon_load()
+        for loaded_ctx in scope:
+            loaded_ctx._abandon_load()
         with _ABANDONED_LOADERS_LOCK:
             _ABANDONED_LOADERS.append(worker)
         raise PluginLoadTimeout(f"load timed out after {timeout:g}s (import + register() never returned)")
@@ -240,7 +256,8 @@ class PluginLoaderMixin:
         from hermes_cli.plugins import LoadedPlugin
         lookup_key = manifest_key(manifest)
         loaded = LoadedPlugin(manifest=manifest, enabled=True, deferred=True)
-        self._plugins[lookup_key] = loaded
+        with self._plugins_lock:
+            self._plugins[lookup_key] = loaded
         if not self._lease_deferred_platform(manifest, lookup_key):
             # Fall back to eager loading so the platform is never silently lost. Runs outside the
             # replacement transaction: the eager load's register() executes on a deadline worker, whose
@@ -433,18 +450,24 @@ class PluginLoaderMixin:
         if reason:
             loaded.error = reason
             logger.warning("Plugin '%s' skipped: %s", plugin_key, reason)
-            self._plugins[plugin_key] = loaded
+            with self._plugins_lock:
+                self._plugins[plugin_key] = loaded
             return
         registration_start = len(self._registration_order)
         module_name = self._policy_module_name(manifest)
         self._track_tool_override_policy(manifest, module_name)
         ctx = PluginContext(manifest, self)
+        in_host = self._runs_in_plugin_host(manifest)
 
         def _import_and_register() -> bool:
             """Import + register() — the part a plugin controls, so the part the deadline covers."""
             # Declared language packs register before any plugin code runs, inside the same ledger slice
             # so a failing register() unwinds them too.
             self._register_declared_locales(manifest, ctx)
+            if in_host and not self._is_manifest_only_language_pack(manifest):
+                self._plugin_host().load(manifest, ctx, module_name=module_name,
+                                         entrypoint=manifest.source not in {"user", "project"})
+                return True
             # Reuse a deferred platform's already-imported package so its body doesn't run twice.
             # See #78050.
             module = self._predeclared_modules.pop(plugin_key, None)
@@ -497,7 +520,8 @@ class PluginLoaderMixin:
         # outlive the load attempt (#78050).
         if not loaded.enabled:
             self._predeclared_tools.pop(plugin_key, None)
-        self._plugins[plugin_key] = loaded
+        with self._plugins_lock:
+            self._plugins[plugin_key] = loaded
 
     @staticmethod
     def _is_manifest_only_language_pack(manifest: PluginManifest) -> bool:
@@ -518,6 +542,19 @@ class PluginLoaderMixin:
             if lang_id not in registered:
                 logger.warning("Plugin '%s' declares provides_locales %r but %s has no %s.yaml",
                                manifest.name, lang_id, locales_dir, lang_id)
+
+    def _runs_in_plugin_host(self, manifest: PluginManifest) -> bool:
+        """``plugins.isolation: host`` sends every non-bundled Python plugin to the profile's host."""
+        from hermes_cli.plugin_isolation import ISOLATION_HOST, isolation_mode
+        return manifest.source != "bundled" and isolation_mode() == ISOLATION_HOST
+
+    def _plugin_host(self) -> Any:
+        """This manager's plugin host (one process per profile home), created on first use."""
+        host = getattr(self, "_plugin_host_instance", None)
+        if host is None:
+            from hermes_cli.plugin_host import PluginHost
+            host = self._plugin_host_instance = PluginHost(self)
+        return host
 
     def _track_tool_override_policy(self, manifest: PluginManifest, module_name: str) -> None:
         """Install the plugin's tool-override policy in tools.registry as a ledger-owned lease."""
@@ -616,7 +653,8 @@ class PluginLoaderMixin:
         except (Exception, SystemExit) as exc:
             loaded.error = _load_error_text(exc)
             logger.warning("Agent Plugin '%s' disabled: %s", lookup_key, loaded.error)
-        self._plugins[lookup_key] = loaded
+        with self._plugins_lock:
+            self._plugins[lookup_key] = loaded
 
     def _directory_module_name(self, manifest: PluginManifest) -> str:
         """Profile-safe import namespace for a directory plugin: the bare ``hermes_plugins.<slug>`` for the
