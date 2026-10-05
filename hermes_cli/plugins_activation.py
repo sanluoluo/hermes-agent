@@ -77,7 +77,7 @@ def plugin_activation_summary(manager: Any, plugin_key: str) -> Dict[str, Any]:
 def activation_summaries(manager: Any) -> List[Dict[str, Any]]:
     """One summary per loaded (non-deferred-platform, non-errored) plugin — the ``on_plugin_loaded`` payload."""
     out = []
-    for key, loaded in list(manager._plugins.items()):
+    for key, loaded in manager.snapshot_plugins():
         if getattr(loaded, "deferred", False) or getattr(loaded, "error", None):
             continue
         out.append(plugin_activation_summary(manager, key))
