@@ -101,7 +101,7 @@ class ClassifiedError:
 # named account, the tier refusing for an anonymous one (see ``_WELCOME_403_NAMED_PATTERNS``).
 _FREE_TIER_REFUSAL_PATTERNS = ("model_not_supported_on_free_tier", "not available on the free tier")
 _BILLING_PATTERNS = (
-    "insufficient credits", "insufficient_quota", "insufficient balance", "credit balance",
+    "insufficient credits", "insufficient_quota", "insufficient balance", "insufficient_balance", "余额不足", "credit balance",
     "credits exhausted", "credits have been exhausted", "requires available credits",
     "account balance is too low", "no usable credits", "top up your credits", "payment required",
     "billing hard limit", "exceeded your current quota", "account is deactivated", "plan does not include",
@@ -1093,6 +1093,11 @@ def _status_5xx(c: _Ctx) -> Verdict:
     validation = any(p in c.msg for p in _REQUEST_VALIDATION_PATTERNS) or c.code in _5XX_VALIDATION_CODES
     if validation and not _is_server_injected_param_rejection(c.msg, c.provider_slug):
         return _V_FORMAT_ERROR
+    # Billing walls proxied as 5xx (e.g. CPA wraps upstream 402 INSUFFICIENT_BALANCE
+    # as 503 "auth_unavailable") must fail over, not retry in place: a billing word in
+    # the body outranks the generic overloaded verdict.
+    if any(p in c.msg for p in _BILLING_PATTERNS):
+        return _V_BILLING
     return _first_match(c.msg, _OVERFLOW_AS_5XX_RULES) or _V_SERVER_ERROR
 
 
@@ -1228,7 +1233,12 @@ _STATUS_HANDLERS: dict[int, Callable[[_Ctx], Verdict]] = {
     403: _status_403, 404: _status_404, 408: lambda c: _V_TIMEOUT, 413: lambda c: _V_PAYLOAD_TOO_LARGE,
     422: lambda c: _classify_image_tool_422(c),
     429: _status_429, 500: _status_5xx, 502: _status_5xx,
-    503: lambda c: _first_match(c.msg, _OVERFLOW_AS_5XX_RULES) or _V_OVERLOADED,
+    # 503 billing-wall wrappers (proxy turns upstream 402 into 503 "auth_unavailable")
+    # must fail over, not retry in place: a billing word outranks the overloaded verdict.
+    503: lambda c: (
+        _V_BILLING if any(p in c.msg for p in _BILLING_PATTERNS)
+        else _first_match(c.msg, _OVERFLOW_AS_5XX_RULES) or _V_OVERLOADED
+    ),
     529: lambda c: _first_match(c.msg, _OVERFLOW_AS_5XX_RULES) or _V_OVERLOADED,
 }
 

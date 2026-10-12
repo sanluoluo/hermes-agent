@@ -487,6 +487,30 @@ class TestClassifyApiError:
         result = classify_api_error(e)
         assert result.reason == FailoverReason.overloaded
 
+    def test_503_billing_wall_wrapped_by_proxy_fails_over(self):
+        """A gateway that wraps an upstream 402 INSUFFICIENT_BALANCE as 503
+        "auth_unavailable" must fail over instead of retrying in place: a
+        billing word in the body outranks the generic overloaded verdict."""
+        e = MockAPIError(
+            "auth_unavailable: upstream 402 INSUFFICIENT_BALANCE (insufficient balance)",
+            status_code=503,
+        )
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.billing
+
+    def test_5xx_billing_word_outranks_server_error(self):
+        e = MockAPIError(
+            "503 Service Unavailable: account balance is too low",
+            status_code=500,
+        )
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.billing
+
+    def test_503_overloaded_without_billing_words_stays_overloaded(self):
+        e = MockAPIError("upstream connect error, no healthy upstream", status_code=503)
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.overloaded
+
 
     def test_408_request_timeout_is_retryable_timeout(self):
         """HTTP 408 Request Timeout is a transient timing failure the server
